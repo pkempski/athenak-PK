@@ -23,7 +23,7 @@ namespace particles {
 
 Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
     pmy_pack(ppack) {
-  std::cout << "Entering Particles constructor" << std::endl;
+  //std::cout << "Entering Particles constructor" << std::endl;
 
   // check this is at least a 2D problem
   if (pmy_pack->pmesh->one_d) {
@@ -52,7 +52,7 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
     char rank_dir[20];
     std::snprintf(rank_dir, sizeof(rank_dir), "rank_%08d", global_variable::my_rank);
     prst_fname.replace(prst_fname.find("rank_00000000"), sizeof("rank_00000000") - 1, rank_dir);
-    std::cout<<"Restarting particles from file "<<prst_fname<<std::endl;
+    //std::cout<<"Restarting particles from file "<<prst_fname<<std::endl;
     std::size_t myoffset = 0;
     Real *gen_data = new Real [3]; 
     FILE* pfile = std::fopen(prst_fname.c_str(),"r");
@@ -62,8 +62,8 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
     std::fclose(pfile);
     delete [] gen_data;
   }
-  std::cout << "Particles: nprtcl_thispack = " << nprtcl_thispack << std::endl;
-  std::cout << "Particles: nprtcl_perspec_thispack = " << nprtcl_perspec_thispack << std::endl;
+  //std::cout << "Particles: nprtcl_thispack = " << nprtcl_thispack << std::endl;
+  //std::cout << "Particles: nprtcl_perspec_thispack = " << nprtcl_perspec_thispack << std::endl;
   // select particle type
   {
     std::string ptype = pin->GetString("particles","particle_type");
@@ -127,7 +127,7 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
 
   // allocate boundary object
   pbval_part = new ParticlesBoundaryValues(this, pin);
-  std::cout << "Exiting Particles constructor" << std::endl;
+  //std::cout << "Exiting Particles constructor" << std::endl;
 }
 
 //----------------------------------------------------------------------------------------
