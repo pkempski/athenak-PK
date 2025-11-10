@@ -39,7 +39,7 @@ class SourceTerms {
   bool rel_cooling;
   bool beam;
   bool shearing_box, shearing_box_r_phi;
-
+  bool local_heating;
   // new timestep
   Real dtnew;
 
@@ -47,9 +47,12 @@ class SourceTerms {
   Real const_accel_val;
   int const_accel_dir;
 
-  // heating rate used with ISM cooling
-  Real hrate;
 
+  Real hrate;
+  // heating rate used with ISM cooling
+  Real h1,h2,h3,h4,h5,h6,h7,h8,r1,r2,r3,r4,r5,r6,r7,r8 ,turb_size;
+  Real x1,y1,x2,y2,x3,y3,x4,y4, x5,y5,x6,y6,x7,y7,x8,y8;
+  //int n_sources;
   // cooling rate used with relativistic cooling
   Real crate_rel;
   Real cpower_rel;
@@ -64,6 +67,8 @@ class SourceTerms {
   void ConstantAccel(const DvceArray5D<Real> &w0, const EOS_Data &eos,
                      const Real dt, DvceArray5D<Real> &u0);
   void ISMCooling(const DvceArray5D<Real> &w0, const EOS_Data &eos,
+                  const Real dt, DvceArray5D<Real> &u0);
+  void LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos,
                   const Real dt, DvceArray5D<Real> &u0);
   void RelCooling(const DvceArray5D<Real> &w0, const EOS_Data &eos,
                   const Real dt, DvceArray5D<Real> &u0);

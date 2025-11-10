@@ -37,7 +37,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   // Things to do only for sims starting from ICs
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
   auto &indcs = pmy_mesh_->mb_indcs;
-
+  auto &size = pmbp->pmb->mb_size;
   if (pmbp->phydro == nullptr && pmbp->pmhd == nullptr) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Turbulence problem generator can only be run with Hydro and/or MHD, but no "
@@ -91,7 +91,19 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     // Set initial conditions
     par_for("pgen_turb", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      u0(m,IDN,k,j,i) = 1.0;
+      Real &x1min = size.d_view(m).x1min;
+      Real &x1max = size.d_view(m).x1max;
+      int nx1 = indcs.nx1;
+      Real x1v = CellCenterX(i-is, nx1, x1min, x1max);    
+      Real &x2min = size.d_view(m).x2min;
+      Real &x2max = size.d_view(m).x2max;
+      int nx2 = indcs.nx2;
+      Real x2v = CellCenterX(j-js, nx2, x2min, x2max);    
+      Real &x3min = size.d_view(m).x3min;
+      Real &x3max = size.d_view(m).x3max;
+      int nx3 = indcs.nx3;
+      Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);      
+      u0(m,IDN,k,j,i) = 1.0 + 0.1 *std::sin(2.0*M_PI*x2v) + 0.1 *std::sin(4.0*M_PI*x2v + 4.0*M_PI*x3v + 2.0*M_PI*x1v+0.5) ;
       u0(m,IM1,k,j,i) = 0.0;
       u0(m,IM2,k,j,i) = 0.0;
       u0(m,IM3,k,j,i) = 0.0;

@@ -73,6 +73,49 @@ SourceTerms::SourceTerms(std::string block, MeshBlockPack *pp, ParameterInput *p
   } else {
     shearing_box = false;
   }
+  // (6) Local Heating
+  local_heating = pin->GetOrAddBoolean(block, "local_heating", false);
+  if (local_heating) {
+    h1 = pin->GetReal(block, "h1");
+    h2 = pin->GetReal(block, "h2");
+    h3 = pin->GetReal(block, "h3");
+    h4 = pin->GetReal(block, "h4");
+    h5 = pin->GetReal(block, "h5");
+    h6 = pin->GetReal(block, "h6");
+    h7 = pin->GetReal(block, "h7");
+    h8 = pin->GetReal(block, "h8");
+
+    r1 = pin->GetReal(block, "r1"); 
+    r2 = pin->GetReal(block, "r2");
+    r3 = pin->GetReal(block, "r3");
+    r4 = pin->GetReal(block, "r4");
+    r5 = pin->GetReal(block, "r5");
+    r6 = pin->GetReal(block, "r6");
+    r7 = pin->GetReal(block, "r7");
+    r8 = pin->GetReal(block, "r8");    
+
+
+    x1 = pin->GetReal(block, "x1");
+    x2 = pin->GetReal(block, "x2");
+    x3 = pin->GetReal(block, "x3");
+    x4 = pin->GetReal(block, "x4");
+    x5 = pin->GetReal(block, "x5");
+    x6 = pin->GetReal(block, "x6");
+    x7 = pin->GetReal(block, "x7");
+    x8 = pin->GetReal(block, "x8");
+    
+    y1 = pin->GetReal(block, "y1");
+    y2 = pin->GetReal(block, "y2");
+    y3 = pin->GetReal(block, "y3");
+    y4 = pin->GetReal(block, "y4");
+    y5 = pin->GetReal(block, "y5");
+    y6 = pin->GetReal(block, "y6");
+    y7 = pin->GetReal(block, "y7");
+    y8 = pin->GetReal(block, "y8");    
+    //n_sources = pin->GetInteger(block, "n_sources");
+    //source_size = pin->GetReal(block, "source_size");
+    turb_size = pin->GetReal(block, "turb_size");
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -235,3 +278,45 @@ void SourceTerms::BeamSource(DvceArray5D<Real> &i0, const Real bdt) {
 
   return;
 }
+
+
+void SourceTerms::LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos_data,
+                             const Real bdt, DvceArray5D<Real> &u0) {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int is = indcs.is, ie = indcs.ie;
+  int js = indcs.js, je = indcs.je;
+  int ks = indcs.ks, ke = indcs.ke;
+  int nmb1 = pmy_pack->nmb_thispack - 1;
+  Real use_e = eos_data.use_e;
+  Real gamma = eos_data.gamma;
+  Real gm1 = gamma - 1.0;
+  MeshBlockPack *pmbp = pmy_pack->pmesh->pmb_pack;
+  auto &size = pmbp->pmb->mb_size; 
+  //Real heating_rate = hrate;
+  par_for("cooling", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
+  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+    Real &x1min = size.d_view(m).x1min;
+    Real &x1max = size.d_view(m).x1max;
+    int nx1 = indcs.nx1;
+    Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
+    Real &x2min = size.d_view(m).x2min;
+    Real &x2max = size.d_view(m).x2max;
+    int nx2 = indcs.nx2;
+    Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
+    Real &x3min = size.d_view(m).x3min;
+    Real &x3max = size.d_view(m).x3max;
+    int nx3 = indcs.nx3;
+    Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
+    // temperature in cgs unit
+    Real temp = 1.0;
+
+    u0(m,IEN,k,j,i) += bdt * w0(m,IDN,k,j,i)*w0(m,IDN,k,j,i) * (h1*std::exp(-((x1v-x1)*(x1v-x1)+(x3v-y1)*(x3v-y1))/r1/r1) +
+		   h2*std::exp(-((x1v-x2)*(x1v-x2)+(x3v-y2)*(x3v-y2))/r2/r2) + h3*std::exp(-((x1v-x3)*(x1v-x3)+(x3v-y3)*(x3v-y3))/r3/r3) +
+		   h4*std::exp(-((x1v-x4)*(x1v-x4)+(x3v-y4)*(x3v-y4))/r4/r4) + h5*std::exp(-((x1v-x5)*(x1v-x5)+(x3v-y5)*(x3v-y5))/r5/r5) +
+		   h6*std::exp(-((x1v-x6)*(x1v-x6)+(x3v-y6)*(x3v-y6))/r6/r6) + + h7*std::exp(-((x1v-x7)*(x1v-x7)+(x3v-y7)*(x3v-y7))/r7/r7) +
+                   h8*std::exp(-((x1v-x8)*(x1v-x8)+(x3v-y8)*(x3v-y8))/r8/r8)    );   
+  });
+
+  return;
+}
+
