@@ -76,46 +76,53 @@ SourceTerms::SourceTerms(std::string block, MeshBlockPack *pp, ParameterInput *p
   // (6) Local Heating
   local_heating = pin->GetOrAddBoolean(block, "local_heating", false);
   if (local_heating) {
-    h1 = pin->GetReal(block, "h1");
-    h2 = pin->GetReal(block, "h2");
-    h3 = pin->GetReal(block, "h3");
-    h4 = pin->GetReal(block, "h4");
-    h5 = pin->GetReal(block, "h5");
-    h6 = pin->GetReal(block, "h6");
-    h7 = pin->GetReal(block, "h7");
-    h8 = pin->GetReal(block, "h8");
+  n_sources = pin->GetInteger(block, "n_sources");
 
-    r1 = pin->GetReal(block, "r1"); 
-    r2 = pin->GetReal(block, "r2");
-    r3 = pin->GetReal(block, "r3");
-    r4 = pin->GetReal(block, "r4");
-    r5 = pin->GetReal(block, "r5");
-    r6 = pin->GetReal(block, "r6");
-    r7 = pin->GetReal(block, "r7");
-    r8 = pin->GetReal(block, "r8");    
+  // -------------------------------
+  // Host-side storage
+  // -------------------------------
+  hbeam.resize(n_sources);
+  rbeam.resize(n_sources);
+  xbeam.resize(n_sources);
+  zbeam.resize(n_sources);
 
+  for (int i = 0; i < n_sources; ++i) {
+    std::string idx = std::to_string(i + 1);
 
-    x1 = pin->GetReal(block, "x1");
-    x2 = pin->GetReal(block, "x2");
-    x3 = pin->GetReal(block, "x3");
-    x4 = pin->GetReal(block, "x4");
-    x5 = pin->GetReal(block, "x5");
-    x6 = pin->GetReal(block, "x6");
-    x7 = pin->GetReal(block, "x7");
-    x8 = pin->GetReal(block, "x8");
-    
-    y1 = pin->GetReal(block, "y1");
-    y2 = pin->GetReal(block, "y2");
-    y3 = pin->GetReal(block, "y3");
-    y4 = pin->GetReal(block, "y4");
-    y5 = pin->GetReal(block, "y5");
-    y6 = pin->GetReal(block, "y6");
-    y7 = pin->GetReal(block, "y7");
-    y8 = pin->GetReal(block, "y8");    
-    //n_sources = pin->GetInteger(block, "n_sources");
-    //source_size = pin->GetReal(block, "source_size");
-    turb_size = pin->GetReal(block, "turb_size");
+    hbeam[i] = pin->GetReal(block, "h" + idx);
+    rbeam[i] = pin->GetReal(block, "r" + idx);
+    xbeam[i] = pin->GetReal(block, "x" + idx);
+    zbeam[i] = pin->GetReal(block, "z" + idx);
   }
+
+  turb_size = pin->GetReal(block, "turb_size");
+
+  // -------------------------------
+  // Device-side storage
+  // -------------------------------
+  hbeam_dvc = Kokkos::View<Real*>("hbeam", n_sources);
+  rbeam_dvc = Kokkos::View<Real*>("rbeam", n_sources);
+  xbeam_dvc = Kokkos::View<Real*>("xbeam", n_sources);
+  zbeam_dvc = Kokkos::View<Real*>("zbeam", n_sources);
+
+    // Host mirrors
+  auto h_h = Kokkos::create_mirror_view(hbeam_dvc);
+  auto r_h = Kokkos::create_mirror_view(rbeam_dvc);
+  auto x_h = Kokkos::create_mirror_view(xbeam_dvc);
+  auto z_h = Kokkos::create_mirror_view(zbeam_dvc);
+
+  for (int s = 0; s < n_sources; ++s) {
+    h_h(s) = hbeam[s];
+    r_h(s) = rbeam[s];
+    x_h(s) = xbeam[s];
+    z_h(s) = zbeam[s];
+  }
+
+  Kokkos::deep_copy(hbeam_dvc, h_h);
+  Kokkos::deep_copy(rbeam_dvc, r_h);
+  Kokkos::deep_copy(xbeam_dvc, x_h);
+  Kokkos::deep_copy(zbeam_dvc, z_h);
+}
 }
 
 //----------------------------------------------------------------------------------------
@@ -292,8 +299,16 @@ void SourceTerms::LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos_
   Real gm1 = gamma - 1.0;
   MeshBlockPack *pmbp = pmy_pack->pmesh->pmb_pack;
   auto &size = pmbp->pmb->mb_size; 
+
+  auto h_d = hbeam_dvc;
+  auto r_d = rbeam_dvc;
+  auto x_d = xbeam_dvc;
+  auto z_d = zbeam_dvc;
+  int ns   = n_sources;
+
+
   //Real heating_rate = hrate;
-  par_for("cooling", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
+  par_for("heating", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     Real &x1min = size.d_view(m).x1min;
     Real &x1max = size.d_view(m).x1max;
@@ -310,11 +325,18 @@ void SourceTerms::LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos_
     // temperature in cgs unit
     Real temp = 1.0;
 
-    u0(m,IEN,k,j,i) += bdt * w0(m,IDN,k,j,i)*w0(m,IDN,k,j,i) * (h1*std::exp(-((x1v-x1)*(x1v-x1)+(x3v-y1)*(x3v-y1))/r1/r1) +
-		   h2*std::exp(-((x1v-x2)*(x1v-x2)+(x3v-y2)*(x3v-y2))/r2/r2) + h3*std::exp(-((x1v-x3)*(x1v-x3)+(x3v-y3)*(x3v-y3))/r3/r3) +
-		   h4*std::exp(-((x1v-x4)*(x1v-x4)+(x3v-y4)*(x3v-y4))/r4/r4) + h5*std::exp(-((x1v-x5)*(x1v-x5)+(x3v-y5)*(x3v-y5))/r5/r5) +
-		   h6*std::exp(-((x1v-x6)*(x1v-x6)+(x3v-y6)*(x3v-y6))/r6/r6) + + h7*std::exp(-((x1v-x7)*(x1v-x7)+(x3v-y7)*(x3v-y7))/r7/r7) +
-                   h8*std::exp(-((x1v-x8)*(x1v-x8)+(x3v-y8)*(x3v-y8))/r8/r8)    );   
+    Real heating=0.0;
+    for (int s = 0; s < ns; ++s) {
+      Real dx = x1v - x_d(s);
+      Real dz = x3v - z_d(s);
+      Real inv_r2 = 1.0 / (r_d(s) * r_d(s));
+
+      heating += h_d(s) *
+               Kokkos::exp(-(dx*dx + dz*dz) * inv_r2);
+    }
+
+    Real rho = w0(m,IDN,k,j,i);
+    u0(m,IEN,k,j,i) += bdt * rho * rho * heating;
   });
 
   return;
