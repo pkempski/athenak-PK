@@ -54,7 +54,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   Real beta = pin->GetOrAddReal("problem","beta",1.0);
   Real A = pin->GetOrAddReal("problem","Amp_rho",0.025);
   Real Hd = pin->GetOrAddReal("problem","Hd",0.25);
-
+  Real rho_min = pin->GetOrAddReal("problem","rho_min",0.2);
+  Real rho_max = pin->GetOrAddReal("problem","rho_max",2.0);
   // Initialize Hydro variables -------------------------------
   if (pmbp->phydro != nullptr) {
     Real d_i = pin->GetOrAddReal("problem","d_i",1.0);
@@ -107,7 +108,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);      
       Real rho = 1.0;
       Real rpos = x1v*x1v+x2v*x2v+x3v*x3v;
-      rho = 0.5+exp(-rpos/2.0/Hd/Hd); //exponential initial density profile   
+      rho = rho_min + (rho_max-rho_min)*exp(-rpos/2.0/Hd/Hd); //exponential initial density profile   
 
       u0(m,IDN,k,j,i) = rho; 
       u0(m,IM1,k,j,i) = 0.0;

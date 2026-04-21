@@ -96,6 +96,7 @@ SourceTerms::SourceTerms(std::string block, MeshBlockPack *pp, ParameterInput *p
   }
 
   turb_size = pin->GetReal(block, "turb_size");
+  zR = pin->GetOrAddReal(block, "zR", 1000.0);
 
   // -------------------------------
   // Device-side storage
@@ -324,14 +325,17 @@ void SourceTerms::LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos_
     Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
     // temperature in cgs unit
     Real temp = 1.0;
+    Real factor = 1.0 + x2v*x2v/zR/zR;
 
     Real heating=0.0;
     for (int s = 0; s < ns; ++s) {
+      Real x_d_new = x_d(s) * Kokkos::sqrt(factor);
+      Real z_d_new = z_d(s) * Kokkos::sqrt(factor);
       Real dx = x1v - x_d(s);
       Real dz = x3v - z_d(s);
-      Real inv_r2 = 1.0 / (r_d(s) * r_d(s));
+      Real inv_r2 = 1.0 / (r_d(s) * r_d(s)) / factor  ;
 
-      heating += h_d(s) *
+      heating += h_d(s)  / factor  *
                Kokkos::exp(-(dx*dx + dz*dz) * inv_r2);
     }
 
