@@ -331,8 +331,8 @@ void SourceTerms::LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos_
     for (int s = 0; s < ns; ++s) {
       Real x_d_new = x_d(s) * Kokkos::sqrt(factor);
       Real z_d_new = z_d(s) * Kokkos::sqrt(factor);
-      Real dx = x1v - x_d(s);
-      Real dz = x3v - z_d(s);
+      Real dx = x1v - x_d_new;
+      Real dz = x3v - z_d_new;
       Real inv_r2 = 1.0 / (r_d(s) * r_d(s)) / factor  ;
 
       heating += h_d(s)  / factor  *
