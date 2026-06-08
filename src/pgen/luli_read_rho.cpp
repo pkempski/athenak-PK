@@ -1,0 +1,431 @@
+//========================================================================================
+// AthenaXXX astrophysical plasma code
+// Copyright(C) 2020 James M. Stone <jmstone@ias.edu> and the Athena code team
+// Licensed under the 3-clause BSD License (the "LICENSE")
+//========================================================================================
+//! \file turb.cpp
+//  \brief Problem generator for turbulence
+#include <iostream> // cout
+
+#include "athena.hpp"
+#include "parameter_input.hpp"
+#include "coordinates/cell_locations.hpp"
+#include "mesh/mesh.hpp"
+#include "eos/eos.hpp"
+#include "hydro/hydro.hpp"
+#include "mhd/mhd.hpp"
+#include "pgen.hpp"
+
+#include <Kokkos_Random.hpp>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <stdexcept>
+// User-defined history functions
+void TurbulentHistory(HistoryData *pdata, Mesh *pm);
+
+
+//----------------------------------------------------------------------------------------
+//! \fn void MeshBlock::Turb_()
+//  \brief Problem Generator for turbulence
+
+void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
+  // Things to do for sims starting from ICs and restarts
+
+  // enroll user history function
+  user_hist_func = TurbulentHistory;
+
+  // end here for restarts
+  if (restart) return;
+
+  // Things to do only for sims starting from ICs
+  MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
+  auto &indcs = pmy_mesh_->mb_indcs;
+  auto &size = pmbp->pmb->mb_size;
+  if (pmbp->phydro == nullptr && pmbp->pmhd == nullptr) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Turbulence problem generator can only be run with Hydro and/or MHD, but no "
+       << "<hydro> or <mhd> block in input file" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  // capture variables for kernel
+  int &is = indcs.is; int &ie = indcs.ie;
+  int &js = indcs.js; int &je = indcs.je;
+  int &ks = indcs.ks; int &ke = indcs.ke;
+
+  Real cs = pin->GetOrAddReal("eos","iso_sound_speed",1.0);
+  Real beta = pin->GetOrAddReal("problem","beta",1.0);
+  Real A = pin->GetOrAddReal("problem","Amp_rho",0.025);
+  Real Hd = pin->GetOrAddReal("problem","Hd",0.25);
+  Real rho_min = pin->GetOrAddReal("problem","rho_min",0.2);
+  Real rho_max = pin->GetOrAddReal("problem","rho_max",2.0);
+
+
+const std::string rho_file =
+    pin->GetOrAddString("problem", "rho_file", "rho_256.bin");
+
+const int in_nx1 = pin->GetOrAddInteger("problem", "rho_nx1", 256);
+const int in_nx2 = pin->GetOrAddInteger("problem", "rho_nx2", 256);
+const int in_nx3 = pin->GetOrAddInteger("problem", "rho_nx3", 256);
+
+if (pmy_mesh_->mesh_indcs.nx1 != in_nx1 ||
+    pmy_mesh_->mesh_indcs.nx2 != in_nx2 ||
+    pmy_mesh_->mesh_indcs.nx3 != in_nx3) {
+  std::cout << "### FATAL ERROR: binary rho dimensions do not match mesh dimensions."
+            << std::endl;
+  std::exit(EXIT_FAILURE);
+}
+
+const int mb_nx1 = indcs.nx1;
+const int mb_nx2 = indcs.nx2;
+const int mb_nx3 = indcs.nx3;
+
+HostArray4D<Real> rho_h("rho_h", pmbp->nmb_thispack, mb_nx3, mb_nx2, mb_nx1);
+
+std::ifstream fin(rho_file, std::ios::binary);
+if (!fin) {
+  std::cout << "### FATAL ERROR: could not open " << rho_file << std::endl;
+  std::exit(EXIT_FAILURE);
+}
+
+std::vector<float> row(mb_nx1);
+
+for (int m = 0; m < pmbp->nmb_thispack; ++m) {
+  const int gid = pmbp->pmb->mb_gid.h_view(m);
+  const auto &lloc = pmy_mesh_->lloc_eachmb[gid];
+
+  if (lloc.level != pmy_mesh_->root_level) {
+    std::cout << "### FATAL ERROR: this simple binary reader assumes no SMR/AMR."
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
+  const int gi0 = lloc.lx1 * mb_nx1;
+  const int gj0 = lloc.lx2 * mb_nx2;
+  const int gk0 = lloc.lx3 * mb_nx3;
+
+  for (int kk = 0; kk < mb_nx3; ++kk) {
+    const int gk = gk0 + kk;
+
+    for (int jj = 0; jj < mb_nx2; ++jj) {
+      const int gj = gj0 + jj;
+
+      const std::size_t offset =
+          (static_cast<std::size_t>(gk) * in_nx2 * in_nx1 +
+           static_cast<std::size_t>(gj) * in_nx1 +
+           static_cast<std::size_t>(gi0)) * sizeof(float);
+
+      fin.seekg(offset, std::ios::beg);
+      fin.read(reinterpret_cast<char*>(row.data()), mb_nx1 * sizeof(float));
+
+      if (!fin) {
+        std::cout << "### FATAL ERROR: failed reading " << rho_file << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+
+      for (int ii = 0; ii < mb_nx1; ++ii) {
+        rho_h(m, kk, jj, ii) = static_cast<Real>(row[ii]);
+      }
+    }
+  }
+}
+
+auto rho_d = Kokkos::create_mirror_view_and_copy(DevMemSpace(), rho_h);
+
+
+
+  // Initialize Hydro variables -------------------------------
+  if (pmbp->phydro != nullptr) {
+    Real d_i = pin->GetOrAddReal("problem","d_i",1.0);
+    Real d_n = pin->GetOrAddReal("problem","d_n",1.0);
+    auto &u0 = pmbp->phydro->u0;
+    EOS_Data &eos = pmbp->phydro->peos->eos_data;
+    Real gm1 = eos.gamma - 1.0;
+    Real p0 = 1.0/eos.gamma;
+
+    // Set initial conditions
+    par_for("pgen_turb", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      u0(m,IDN,k,j,i) = d_n;
+      u0(m,IM1,k,j,i) = 0.0;
+      u0(m,IM2,k,j,i) = 0.0;
+      u0(m,IM3,k,j,i) = 0.0;
+      if (eos.is_ideal) {
+        u0(m,IEN,k,j,i) = p0/gm1 +
+           0.5*(SQR(u0(m,IM1,k,j,i)) + SQR(u0(m,IM2,k,j,i)) +
+           SQR(u0(m,IM3,k,j,i)))/u0(m,IDN,k,j,i);
+      }
+    });
+  }
+
+  // Initialize MHD variables ---------------------------------
+  if (pmbp->pmhd != nullptr) {
+    Real d_i = pin->GetOrAddReal("problem","d_i",1.0);
+    Real d_n = pin->GetOrAddReal("problem","d_n",1.0);
+    Real B0 = cs*std::sqrt(2.0*d_i/beta);
+    auto &u0 = pmbp->pmhd->u0;
+    auto &b0 = pmbp->pmhd->b0;
+    EOS_Data &eos = pmbp->pmhd->peos->eos_data;
+    Real gm1 = eos.gamma - 1.0;
+    Real p0 = 1.0/eos.gamma;
+    // Set initial conditions
+    //Kokkos::Random_XorShift64_Pool<> rand_pool64(pmbp->gids);
+    auto rho_from_file = rho_d;
+    par_for("pgen_turb", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real &x1min = size.d_view(m).x1min;
+      Real &x1max = size.d_view(m).x1max;
+      int nx1 = indcs.nx1;
+      Real x1v = CellCenterX(i-is, nx1, x1min, x1max);    
+      Real &x2min = size.d_view(m).x2min;
+      Real &x2max = size.d_view(m).x2max;
+      int nx2 = indcs.nx2;
+      Real x2v = CellCenterX(j-js, nx2, x2min, x2max);    
+      Real &x3min = size.d_view(m).x3min;
+      Real &x3max = size.d_view(m).x3max;
+      int nx3 = indcs.nx3;
+      Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);      
+      Real rho = 1.0;
+      Real rpos = x1v*x1v+x2v*x2v+x3v*x3v;
+	//rho = rho_min + (rho_max-rho_min)*exp(-rpos/2.0/Hd/Hd); //exponential initial density profile   
+      rho = rho_from_file(m, k-ks, j-js, i-is);
+      u0(m,IDN,k,j,i) = rho; 
+      u0(m,IM1,k,j,i) = 0.0;
+      u0(m,IM2,k,j,i) = 0.0;
+      u0(m,IM3,k,j,i) = 0.0;
+
+      // initialize B
+      b0.x1f(m,k,j,i) = 0.0;
+      b0.x2f(m,k,j,i) = 0.0;
+      b0.x3f(m,k,j,i) = B0;
+      if (i==ie) {b0.x1f(m,k,j,i+1) = 0.0;}
+      if (j==je) {b0.x2f(m,k,j+1,i) = 0.0;}
+      if (k==ke) {b0.x3f(m,k+1,j,i) = B0;}
+
+      if (eos.is_ideal) {
+        u0(m,IEN,k,j,i) = p0/gm1 + 0.5*B0*B0 + // fix contribution from dB
+           0.5*(SQR(u0(m,IM1,k,j,i)) + SQR(u0(m,IM2,k,j,i)) +
+           SQR(u0(m,IM3,k,j,i)))/u0(m,IDN,k,j,i);
+      }
+    });
+  }
+
+  // Initialize ion-neutral variables -------------------------
+  if (pmbp->pionn != nullptr) {
+    Real d_i = pin->GetOrAddReal("problem","d_i",1.0);
+    Real d_n = pin->GetOrAddReal("problem","d_n",1.0);
+    Real B0 = cs*std::sqrt(2.0*(d_i+d_n)/beta);
+
+    // MHD
+    auto &u0 = pmbp->pmhd->u0;
+    auto &b0 = pmbp->pmhd->b0;
+    EOS_Data &eos = pmbp->pmhd->peos->eos_data;
+    Real gm1 = eos.gamma - 1.0;
+    Real p0 = d_i/eos.gamma; // TODO(@user): multiply by ionized density
+
+    // Set initial conditions
+    par_for("pgen_turb_mhd", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      u0(m,IDN,k,j,i) = d_i;
+      u0(m,IM1,k,j,i) = 0.0;
+      u0(m,IM2,k,j,i) = 0.0;
+      u0(m,IM3,k,j,i) = 0.0;
+
+      // initialize B
+      b0.x1f(m,k,j,i) = 0.0;
+      b0.x2f(m,k,j,i) = 0.0;
+      b0.x3f(m,k,j,i) = B0;
+      if (i==ie) {b0.x1f(m,k,j,i+1) = 0.0;}
+      if (j==je) {b0.x2f(m,k,j+1,i) = 0.0;}
+      if (k==ke) {b0.x3f(m,k+1,j,i) = B0;}
+
+      if (eos.is_ideal) {
+        u0(m,IEN,k,j,i) = p0/gm1 + 0.5*B0*B0 + // fix contribution from dB
+           0.5*(SQR(u0(m,IM1,k,j,i)) + SQR(u0(m,IM2,k,j,i)) +
+           SQR(u0(m,IM3,k,j,i)))/u0(m,IDN,k,j,i);
+      }
+    });
+    // Hydro
+    auto &u0_ = pmbp->phydro->u0;
+    EOS_Data &eos_ = pmbp->phydro->peos->eos_data;
+    Real gm1_ = eos_.gamma - 1.0;
+    Real p0_ = d_n/eos_.gamma; // TODO(@user): multiply by neutral density
+
+    // Set initial conditions
+    par_for("pgen_turb_hydro", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      u0_(m,IDN,k,j,i) = d_n;
+      u0_(m,IM1,k,j,i) = 0.0;
+      u0_(m,IM2,k,j,i) = 0.0;
+      u0_(m,IM3,k,j,i) = 0.0;
+      if (eos_.is_ideal) {
+        u0_(m,IEN,k,j,i) = p0_/gm1_ +
+            0.5*(SQR(u0_(m,IM1,k,j,i)) + SQR(u0_(m,IM2,k,j,i)) +
+            SQR(u0_(m,IM3,k,j,i)))/u0_(m,IDN,k,j,i);
+      }
+    });
+  }
+
+  return;
+}
+
+
+//----------------------------------------------------------------------------------------
+// Function for computing history variables
+// 0 = < B^4 >
+// 1 = < (d_j B_i)(d_j B_i) >
+// 2 = < (B_j d_j B_i)(B_k d_k B_i) >
+// 3 = < |BxJ|^2 >
+// 4 = < |B.J|^2 >
+// 5 = < U^2 >
+// 6 = < (d_j U_i)(d_j U_i) >
+void TurbulentHistory(HistoryData *pdata, Mesh *pm) {
+  pdata->nhist = 11;
+  pdata->label[0] = "Bx";
+  pdata->label[1] = "By";
+  pdata->label[2] = "Bz";
+  pdata->label[3] = "B^2";
+  pdata->label[4] = "B^4";
+  pdata->label[5] = "dB^2";
+  pdata->label[6] = "BdB^2";
+  pdata->label[7] = "|BxJ|^2";
+  pdata->label[8] = "|B.J|^2";
+  pdata->label[9] = "U^2";
+  pdata->label[10] = "dU";
+
+  // capture class variabels for kernel
+  auto &bcc = pm->pmb_pack->pmhd->bcc0;
+  auto &b = pm->pmb_pack->pmhd->b0;
+  auto &w0_ = pm->pmb_pack->pmhd->w0;
+  auto &size = pm->pmb_pack->pmb->mb_size;
+  int &nhist_ = pdata->nhist;
+
+  // loop over all MeshBlocks in this pack
+  auto &indcs = pm->pmb_pack->pmesh->mb_indcs;
+  int is = indcs.is; int nx1 = indcs.nx1;
+  int js = indcs.js; int nx2 = indcs.nx2;
+  int ks = indcs.ks; int nx3 = indcs.nx3;
+  const int nmkji = (pm->pmb_pack->nmb_thispack)*nx3*nx2*nx1;
+  const int nkji = nx3*nx2*nx1;
+  const int nji  = nx2*nx1;
+  array_sum::GlobalSum sum_this_mb;
+  Kokkos::parallel_reduce("HistSums",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
+  KOKKOS_LAMBDA(const int &idx, array_sum::GlobalSum &mb_sum) {
+    // compute n,k,j,i indices of thread
+    int m = (idx)/nkji;
+    int k = (idx - m*nkji)/nji;
+    int j = (idx - m*nkji - k*nji)/nx1;
+    int i = (idx - m*nkji - k*nji - j*nx1) + is;
+    k += ks;
+    j += js;
+
+    Real vol = size.d_view(m).dx1*size.d_view(m).dx2*size.d_view(m).dx3;
+    Real dx_squared = size.d_view(m).dx1 * size.d_view(m).dx1;
+
+    // MHD conserved variables:
+    array_sum::GlobalSum hvars;
+
+    // calculate mean B
+    hvars.the_array[0] = bcc(m,IBX,k,j,i)*vol;
+    hvars.the_array[1] = bcc(m,IBY,k,j,i)*vol;
+    hvars.the_array[2] = bcc(m,IBZ,k,j,i)*vol;
+
+    // 0 = < B^2 >
+    Real B_mag_sq = bcc(m,IBX,k,j,i)*bcc(m,IBX,k,j,i)
+                  + bcc(m,IBY,k,j,i)*bcc(m,IBY,k,j,i)
+                  + bcc(m,IBZ,k,j,i)*bcc(m,IBZ,k,j,i);
+    hvars.the_array[3] = B_mag_sq*vol;
+    // 0 = < B^4 >
+    Real B_fourth = B_mag_sq*B_mag_sq;
+    hvars.the_array[4] = B_fourth*vol;
+    // 1 = < (d_j B_i)(d_j B_i) >
+    hvars.the_array[5] = (
+      ((b.x1f(m,k,j,i+1)-b.x1f(m,k,j,i))*(b.x1f(m,k,j,i+1)-b.x1f(m,k,j,i))
+     + (b.x2f(m,k,j+1,i)-b.x2f(m,k,j,i))*(b.x2f(m,k,j+1,i)-b.x2f(m,k,j,i))
+     + (b.x3f(m,k+1,j,i)-b.x3f(m,k,j,i))*(b.x3f(m,k+1,j,i)-b.x3f(m,k,j,i))
+     + 0.25*(bcc(m,IBX,k,j+1,i)-bcc(m,IBX,k,j-1,i))
+           *(bcc(m,IBX,k,j+1,i)-bcc(m,IBX,k,j-1,i))
+     + 0.25*(bcc(m,IBX,k+1,j,i)-bcc(m,IBX,k-1,j,i))
+           *(bcc(m,IBX,k+1,j,i)-bcc(m,IBX,k-1,j,i))
+     + 0.25*(bcc(m,IBY,k,j,i+1)-bcc(m,IBY,k,j,i-1))
+           *(bcc(m,IBY,k,j,i+1)-bcc(m,IBY,k,j,i-1))
+     + 0.25*(bcc(m,IBY,k+1,j,i)-bcc(m,IBY,k-1,j,i))
+           *(bcc(m,IBY,k+1,j,i)-bcc(m,IBY,k-1,j,i))
+     + 0.25*(bcc(m,IBZ,k,j,i+1)-bcc(m,IBZ,k,j,i-1))
+           *(bcc(m,IBZ,k,j,i+1)-bcc(m,IBZ,k,j,i-1))
+     + 0.25*(bcc(m,IBZ,k,j+1,i)-bcc(m,IBZ,i,j-1,i))
+           *(bcc(m,IBZ,k,j+1,i)-bcc(m,IBZ,i,j-1,i)))
+       / dx_squared)*vol;
+    // 2 = < (B_j d_j B_i)(B_k d_k B_i) >
+    Real bdb1 = bcc(m,IBX,k,j,i)*(b.x1f(m,k,j,i+1)-b.x1f(m,k,j,i))
+                +0.5*bcc(m,IBY,k,j,i)*(bcc(m,IBX,k,j+1,i)-bcc(m,IBX,k,j-1,i))
+                +0.5*bcc(m,IBZ,k,j,i)*(bcc(m,IBX,k+1,j,i)-bcc(m,IBX,k-1,j,i));
+    Real bdb2 = bcc(m,IBY,k,j,i)*(b.x2f(m,k,j+1,i)-b.x2f(m,k,j,i))
+                +0.5*bcc(m,IBZ,k,j,i)*(bcc(m,IBY,k+1,j,i)-bcc(m,IBY,k-1,j,i))
+                +0.5*bcc(m,IBX,k,j,i)*(bcc(m,IBY,k,j,i+1)-bcc(m,IBY,k,j,i-1));
+    Real bdb3 = bcc(m,IBZ,k,j,i)*(b.x3f(m,k+1,j,i)-b.x3f(m,k,j,i))
+                +0.5*bcc(m,IBX,k,j,i)*(bcc(m,IBZ,k,j,i+1)-bcc(m,IBZ,k,j,i-1))
+                +0.5*bcc(m,IBY,k,j,i)*(bcc(m,IBZ,k,j+1,i)-bcc(m,IBZ,k,j-1,i));
+    hvars.the_array[6] = ((bdb1*bdb1 + bdb2*bdb2 + bdb3*bdb3) / dx_squared)*vol;
+    // 3 = < |BxJ|^2 >
+    Real Jx = 0.5*(bcc(m,IBZ,k,j+1,i)-bcc(m,IBZ,k,j-1,i))
+             -0.5*(bcc(m,IBY,k+1,j,i)-bcc(m,IBY,k-1,j,i));
+    Real Jy = 0.5*(bcc(m,IBX,k+1,j,i)-bcc(m,IBX,k-1,j,i))
+             -0.5*(bcc(m,IBZ,k,j,i+1)-bcc(m,IBZ,k,j,i-1));
+    Real Jz = 0.5*(bcc(m,IBY,k,j,i+1)-bcc(m,IBY,k,j,i-1))
+             -0.5*(bcc(m,IBX,k,j+1,i)-bcc(m,IBX,k,j-1,i));
+    hvars.the_array[7] =((
+       (bcc(m,IBY,k,j,i)*Jz - bcc(m,IBZ,k,j,i)*Jy)
+      *(bcc(m,IBY,k,j,i)*Jz - bcc(m,IBZ,k,j,i)*Jy)
+      +(bcc(m,IBZ,k,j,i)*Jx - bcc(m,IBX,k,j,i)*Jz)
+      *(bcc(m,IBZ,k,j,i)*Jx - bcc(m,IBX,k,j,i)*Jz)
+      +(bcc(m,IBX,k,j,i)*Jy - bcc(m,IBY,k,j,i)*Jx)
+      *(bcc(m,IBX,k,j,i)*Jy - bcc(m,IBY,k,j,i)*Jx))
+                    / dx_squared)*vol;
+    // 4 = < |B.J|^2 >
+    hvars.the_array[8] = (
+      ((bcc(m,IBX,k,j,i)*Jx + bcc(m,IBY,k,j,i)*Jy + bcc(m,IBZ,k,j,i)*Jz)
+      *(bcc(m,IBX,k,j,i)*Jx + bcc(m,IBY,k,j,i)*Jy + bcc(m,IBZ,k,j,i)*Jz)
+                          )/dx_squared)*vol;
+    // 5 = < U^2 >
+    hvars.the_array[9] += ((w0_(m,IVX,k,j,i)*w0_(m,IVX,k,j,i))
+                        + (w0_(m,IVY,k,j,i)*w0_(m,IVY,k,j,i))
+                        + (w0_(m,IVZ,k,j,i)*w0_(m,IVZ,k,j,i)))*vol;
+    // 6 = < (d_j U_i)(d_j U_i) >
+    hvars.the_array[10] +=
+    (((0.25*(w0_(m,IVX,k,j,i+1)-w0_(m,IVX,k,j,i-1))
+           *(w0_(m,IVX,k,j,i+1)-w0_(m,IVX,k,j,i-1))
+     + 0.25*(w0_(m,IVY,k,j+1,i)-w0_(m,IVY,k,j-1,i))
+           *(w0_(m,IVY,k,j+1,i)-w0_(m,IVY,k,j-1,i))
+     + 0.25*(w0_(m,IVZ,k+1,j,i)-w0_(m,IVZ,k-1,j,i))
+           *(w0_(m,IVZ,k+1,j,i)-w0_(m,IVZ,k-1,j,i))
+     + 0.25*(w0_(m,IVX,k,j+1,i)-w0_(m,IVX,k,j-1,i))
+           *(w0_(m,IVX,k,j+1,i)-w0_(m,IVX,k,j-1,i))
+     + 0.25*(w0_(m,IVX,k+1,j,i)-w0_(m,IVX,k-1,j,i))
+           *(w0_(m,IVX,k+1,j,i)-w0_(m,IVX,k-1,j,i))
+     + 0.25*(w0_(m,IVY,k,j,i+1)-w0_(m,IVY,k,j,i-1))
+           *(w0_(m,IVY,k,j,i+1)-w0_(m,IVY,k,j,i-1))
+     + 0.25*(w0_(m,IVY,k+1,j,i)-w0_(m,IVY,k-1,j,i))
+           *(w0_(m,IVY,k+1,j,i)-w0_(m,IVY,k-1,j,i))
+     + 0.25*(w0_(m,IVZ,k,j,i+1)-w0_(m,IVZ,k,j,i-1))
+           *(w0_(m,IVZ,k,j,i+1)-w0_(m,IVZ,k,j,i-1))
+     + 0.25*(w0_(m,IVZ,k,j+1,i)-w0_(m,IVZ,k,j-1,i))
+           *(w0_(m,IVZ,k,j+1,i)-w0_(m,IVZ,k,j-1,i))))
+     / dx_squared)*vol;
+
+    // fill rest of the_array with zeros, if nhist < NHISTORY_VARIABLES
+    for (int n=nhist_; n<NHISTORY_VARIABLES; ++n) {
+      hvars.the_array[n] = 0.0;
+    }
+
+    // sum into parallel reduce
+    mb_sum += hvars;
+  }, Kokkos::Sum<array_sum::GlobalSum>(sum_this_mb));
+
+  // store data into hdata array
+  for (int n=0; n<pdata->nhist; ++n) {
+    pdata->hdata[n] = sum_this_mb.the_array[n];
+  }
+  return;
+}
