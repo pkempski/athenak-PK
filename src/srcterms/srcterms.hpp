@@ -14,7 +14,7 @@
 
 #include <map>
 #include <string>
-
+#include <random>
 #include "athena.hpp"
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
@@ -55,14 +55,23 @@ class SourceTerms {
   int n_sources;
   Real turb_size;
   Real zR;
+  Real lambda_speck, amp_speck, tdec_speck; 
   //std::vector<Real> hbeam;
   //std::vector<Real> rbeam;
   //std::vector<Real> xbeam;
   //std::vector<Real> zbeam;
     // Host-side storage (input)
-  std::vector<Real> hbeam, rbeam, xbeam, zbeam;
+  std::vector<Real> hbeam, rbeam, xbeam, zbeam, phases;
   // Device-side storage (kernels)
-  Kokkos::View<Real*> hbeam_dvc, rbeam_dvc, xbeam_dvc, zbeam_dvc;
+  Kokkos::View<Real*> hbeam_dvc, rbeam_dvc, xbeam_dvc, zbeam_dvc, phases_dvc;
+
+  std::mt19937 rng_speck;
+  std::normal_distribution<Real> normal_speck{0.0, 1.0};
+
+  Real sigma_phi_speck;
+  int seed_speck;
+
+  void UpdateSpecklePhases(const Real dt);
 
   // cooling rate used with relativistic cooling
   Real crate_rel;

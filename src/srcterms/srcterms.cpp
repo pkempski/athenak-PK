@@ -12,6 +12,7 @@
 
 #include <iostream>
 #include <string> // string
+#include <cmath>
 
 #include "athena.hpp"
 #include "coordinates/cartesian_ks.hpp"
@@ -85,18 +86,27 @@ SourceTerms::SourceTerms(std::string block, MeshBlockPack *pp, ParameterInput *p
   rbeam.resize(n_sources);
   xbeam.resize(n_sources);
   zbeam.resize(n_sources);
-
+  phases.resize(n_sources);
   for (int i = 0; i < n_sources; ++i) {
     std::string idx = std::to_string(i + 1);
-
     hbeam[i] = pin->GetReal(block, "h" + idx);
     rbeam[i] = pin->GetReal(block, "r" + idx);
     xbeam[i] = pin->GetReal(block, "x" + idx);
     zbeam[i] = pin->GetReal(block, "z" + idx);
+    phases[i] = pin->GetReal(block, "phi" + idx);
   }
 
   turb_size = pin->GetReal(block, "turb_size");
   zR = pin->GetOrAddReal(block, "zR", 1000.0);
+
+
+  lambda_speck = pin->GetOrAddReal(block, "lambda_speck", 1.0);
+  amp_speck =  pin->GetOrAddReal(block, "amp_speck", 0.0);
+  tdec_speck = pin->GetOrAddReal(block, "tdec_speck", 0.5);
+
+  sigma_phi_speck = pin->GetOrAddReal(block, "sigma_phi_speck", 1.0);
+  seed_speck = pin->GetOrAddInteger(block, "seed_speck", 12345);
+  rng_speck.seed(seed_speck);
 
   // -------------------------------
   // Device-side storage
@@ -105,24 +115,27 @@ SourceTerms::SourceTerms(std::string block, MeshBlockPack *pp, ParameterInput *p
   rbeam_dvc = Kokkos::View<Real*>("rbeam", n_sources);
   xbeam_dvc = Kokkos::View<Real*>("xbeam", n_sources);
   zbeam_dvc = Kokkos::View<Real*>("zbeam", n_sources);
+  phases_dvc = Kokkos::View<Real*>("phases", n_sources);
 
     // Host mirrors
   auto h_h = Kokkos::create_mirror_view(hbeam_dvc);
   auto r_h = Kokkos::create_mirror_view(rbeam_dvc);
   auto x_h = Kokkos::create_mirror_view(xbeam_dvc);
   auto z_h = Kokkos::create_mirror_view(zbeam_dvc);
-
+  auto phi_h = Kokkos::create_mirror_view(phases_dvc);
   for (int s = 0; s < n_sources; ++s) {
     h_h(s) = hbeam[s];
     r_h(s) = rbeam[s];
     x_h(s) = xbeam[s];
     z_h(s) = zbeam[s];
+    phi_h(s) = phases[s];
   }
 
   Kokkos::deep_copy(hbeam_dvc, h_h);
   Kokkos::deep_copy(rbeam_dvc, r_h);
   Kokkos::deep_copy(xbeam_dvc, x_h);
   Kokkos::deep_copy(zbeam_dvc, z_h);
+  Kokkos::deep_copy(phases_dvc, phi_h);
 }
 }
 
@@ -288,6 +301,37 @@ void SourceTerms::BeamSource(DvceArray5D<Real> &i0, const Real bdt) {
 }
 
 
+void SourceTerms::UpdateSpecklePhases(const Real dt) {
+  if (!local_heating) return;
+  if (tdec_speck <= 0.0) return;
+  if (n_sources <= 0) return;
+
+  const Real a = std::exp(-dt / tdec_speck);
+  const Real b = std::sqrt(1.0 - a*a);
+
+  for (int s = 0; s < n_sources; ++s) {
+    const Real xi = normal_speck(rng_speck);
+
+    phases[s] =
+        a * phases[s]
+      + sigma_phi_speck * b * xi;
+
+    phases[s] = std::fmod(phases[s], 2.0*M_PI);
+
+    if (phases[s] < 0.0) {
+      phases[s] += 2.0*M_PI;
+    }
+  }
+
+  auto phi_h = Kokkos::create_mirror_view(phases_dvc);
+
+  for (int s = 0; s < n_sources; ++s) {
+    phi_h(s) = phases[s];
+  }
+
+  Kokkos::deep_copy(phases_dvc, phi_h);
+}
+
 void SourceTerms::LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos_data,
                              const Real bdt, DvceArray5D<Real> &u0) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -301,11 +345,18 @@ void SourceTerms::LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos_
   MeshBlockPack *pmbp = pmy_pack->pmesh->pmb_pack;
   auto &size = pmbp->pmb->mb_size; 
 
+  UpdateSpecklePhases(bdt);
+
+
   auto h_d = hbeam_dvc;
   auto r_d = rbeam_dvc;
   auto x_d = xbeam_dvc;
   auto z_d = zbeam_dvc;
+  auto phi_d = phases_dvc;
   int ns   = n_sources;
+  auto amp = amp_speck;
+  auto tdec = tdec_speck;
+  auto lambda = lambda_speck;
 
 
   //Real heating_rate = hrate;
@@ -329,8 +380,10 @@ void SourceTerms::LocalHeating(const DvceArray5D<Real> &w0, const EOS_Data &eos_
 
     Real heating=0.0;
     for (int s = 0; s < ns; ++s) {
-      Real x_d_new = x_d(s) * Kokkos::sqrt(factor);
-      Real z_d_new = z_d(s) * Kokkos::sqrt(factor);
+      Real speck = 1.0 + amp*Kokkos::cos(2.0*M_PI*x2v/lambda + phi_d(s));
+      Real x_d_new = x_d(s) * speck * Kokkos::sqrt(factor);
+      Real z_d_new = z_d(s) * speck * Kokkos::sqrt(factor);
+
       Real dx = x1v - x_d_new;
       Real dz = x3v - z_d_new;
       Real inv_r2 = 1.0 / (r_d(s) * r_d(s)) / factor  ;
